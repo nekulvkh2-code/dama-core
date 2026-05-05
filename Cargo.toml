@@ -12,3 +12,7 @@ serde_json = "1.0"
 # Добавляем Tor
 arti-client = "0.10"
 tor-rtcompat = "0.10"
+x25519-dalek = "2.0"
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
