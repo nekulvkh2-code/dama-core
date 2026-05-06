@@ -5,25 +5,44 @@ use std::error::Error;
 use futures::StreamExt;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::fs;
+use chrono::Local;
+use rfd::FileDialog;
+use serde::{Serialize, Deserialize};
 
-// --- ИНТЕРФЕЙС ПРИЛОЖЕНИЯ ---
+#[derive(Serialize, Deserialize, Debug, Clone)]
+enum DamaPacket {
+    Text(String),
+    File { name: String, data: String },
+    SetAddress(String), // Новый тип пакета для обновления адреса в UI
+}
+
+struct Contact { name: String, addr: String }
+
 struct DamaApp {
     peer_id: String,
-    target_addr: String,
+    my_address: String,
+    new_contact_name: String,
+    new_contact_addr: String,
+    contacts: Vec<Contact>,
+    selected_contact: Option<usize>,
     message_text: String,
     history: Vec<String>,
-    tx_to_network: Sender<String>,
-    rx_from_network: Receiver<String>,
+    tx_to_network: Sender<DamaPacket>,
+    rx_from_network: Receiver<(String, DamaPacket)>,
 }
 
 impl DamaApp {
-    fn new(_cc: &eframe::CreationContext<'_>, tx: Sender<String>, rx: Receiver<String>, id: String) -> Self {
+    fn new(_cc: &eframe::CreationContext<'_>, tx: Sender<DamaPacket>, rx: Receiver<(String, DamaPacket)>, id: String) -> Self {
         _cc.egui_ctx.set_visuals(egui::Visuals::dark());
         Self {
             peer_id: id,
-            target_addr: String::new(),
+            my_address: "Ожидание сети...".to_string(),
+            new_contact_name: String::new(),
+            new_contact_addr: String::new(),
+            contacts: Vec::new(),
+            selected_contact: None,
             message_text: String::new(),
-            history: vec!["[SYSTEM]: DAMA Core запущен...".to_string()],
+            history: vec!["[SYSTEM]: Узел запущен.".to_string()],
             tx_to_network: tx,
             rx_from_network: rx,
         }
@@ -32,52 +51,101 @@ impl DamaApp {
 
 impl eframe::App for DamaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        while let Ok(msg) = self.rx_from_network.try_recv() {
-            self.history.push(msg);
+        while let Ok((sender, packet)) = self.rx_from_network.try_recv() {
+            let time = Local::now().format("%H:%M");
+            match packet {
+                DamaPacket::Text(t) => self.history.push(format!("[{}] {}: {}", time, sender, t)),
+                DamaPacket::File { name, .. } => self.history.push(format!("[{}] {} отправил файл: {}", time, sender, name)),
+                DamaPacket::SetAddress(addr) => self.my_address = addr, // Обновляем адрес в UI
+            }
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.visuals_mut().override_text_color = Some(egui::Color32::from_rgb(0, 255, 0));
-            
+        // --- ВЕРХНЯЯ ИНФО-ПАНЕЛЬ ---
+        egui::TopBottomPanel::top("top_info").show(ctx, |ui| {
+            ui.add_space(5.0);
             ui.horizontal(|ui| {
-                ui.heading("📟 DAMA CORE | DARKNET NODE");
+                ui.heading(egui::RichText::new("📟 DAMA CORE").color(egui::Color32::from_rgb(0, 255, 0)));
+                ui.separator();
+                
+                // Отображение PeerID
+                ui.label("ID:");
+                ui.code(&self.peer_id[..10]);
+                if ui.button("📋").on_hover_text("Копировать ID").clicked() {
+                    ui.output_mut(|o| o.copied_text = self.peer_id.clone());
+                }
+
+                ui.separator();
+
+                // Отображение Адреса
+                ui.label("Адрес:");
+                ui.code(&self.my_address);
+                if ui.button("📋").on_hover_text("Копировать адрес").clicked() {
+                    ui.output_mut(|o| o.copied_text = self.my_address.clone());
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // --- КНОПКА ПАНИКИ ---
-                    let panic_btn = ui.add(egui::Button::new(egui::RichText::new("🚨 PANIC").color(egui::Color32::BLACK)).fill(egui::Color32::RED));
-                    if panic_btn.clicked() {
-                        let _ = fs::remove_file("dama_vault.db"); // Стираем базу
-                        std::process::exit(0); // Мгновенно выходим
+                    if ui.add(egui::Button::new("🚨 PANIC").fill(egui::Color32::RED)).clicked() {
+                        let _ = fs::remove_file("dama_vault.db");
+                        std::process::exit(0);
                     }
                 });
             });
+            ui.add_space(5.0);
+        });
 
-            ui.label(format!("ID: {}", self.peer_id));
+        // --- ЛЕВАЯ ПАНЕЛЬ (КОНТАКТЫ) ---
+        egui::SidePanel::left("contacts_side").resizable(true).default_width(180.0).show(ctx, |ui| {
+            ui.heading("👥 Контакты");
             ui.separator();
+            for (i, contact) in self.contacts.iter().enumerate() {
+                if ui.selectable_label(self.selected_contact == Some(i), &contact.name).clicked() {
+                    self.selected_contact = Some(i);
+                    self.new_contact_addr = contact.addr.clone();
+                }
+            }
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                if ui.button("➕ Добавить").clicked() {
+                    self.contacts.push(Contact { name: self.new_contact_name.clone(), addr: self.new_contact_addr.clone() });
+                    self.new_contact_name.clear();
+                }
+                ui.add(egui::TextEdit::singleline(&mut self.new_contact_addr).hint_text("Адрес /ip4/..."));
+                ui.add(egui::TextEdit::singleline(&mut self.new_contact_name).hint_text("Имя"));
+            });
+        });
 
-            ui.horizontal(|ui| {
-                ui.label("Target:");
-                ui.text_edit_singleline(&mut self.target_addr);
-                if ui.button("📡 CONNECT").clicked() {
-                    let _ = self.tx_to_network.send(format!("/connect {}", self.target_addr));
+        // --- ЦЕНТРАЛЬНАЯ ПАНЕЛЬ (ЧАТ) ---
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical().max_height(ui.available_height() - 40.0).stick_to_bottom(true).show(ui, |ui| {
+                for line in &self.history {
+                    ui.label(egui::RichText::new(line).monospace().color(egui::Color32::from_rgb(0, 200, 0)));
                 }
             });
 
-            ui.add_space(10.0);
-            egui::ScrollArea::vertical().max_height(300.0).stick_to_bottom(true).show(ui, |ui| {
-                for msg in &self.history {
-                    ui.label(egui::RichText::new(msg).monospace());
-                }
-            });
-
-            ui.add_space(10.0);
             ui.horizontal(|ui| {
+                if ui.button("📎").clicked() {
+                    if let Some(path) = FileDialog::new().pick_file() {
+                        if let Ok(bytes) = fs::read(&path) {
+                            let packet = DamaPacket::File { name: path.file_name().unwrap().to_string_lossy().into(), data: base64::encode(bytes) };
+                            let _ = self.tx_to_network.send(packet);
+                            self.history.push(format!("Вы отправили файл: {}", path.display()));
+                        }
+                    }
+                }
                 let res = ui.text_edit_singleline(&mut self.message_text);
                 if ui.button("📤 SEND").clicked() || (res.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter))) {
                     if !self.message_text.is_empty() {
-                        let _ = self.tx_to_network.send(self.message_text.clone());
-                        self.history.push(format!("> Вы: {}", self.message_text));
+                        let input = self.message_text.trim().to_string();
+                        if input.starts_with("/ip4/") {
+                            let _ = self.tx_to_network.send(DamaPacket::Text(format!("/connect {}", input)));
+                        } else {
+                            let _ = self.tx_to_network.send(DamaPacket::Text(input.clone()));
+                            self.history.push(format!("Вы: {}", input));
+                        }
                         self.message_text.clear();
                     }
+                }
+                if ui.button("📡 CONNECT").clicked() {
+                    let _ = self.tx_to_network.send(DamaPacket::Text(format!("/connect {}", self.new_contact_addr)));
                 }
             });
         });
@@ -95,11 +163,8 @@ struct DamaBehaviour {
 fn main() -> Result<(), Box<dyn Error>> {
     let local_key = identity::Keypair::generate_ed25519();
     let local_peer_id = PeerId::from(local_key.public());
-    
-    // ПРАВКА ТИПОВ: Явно указываем <String>, чтобы Rust не гадал
-    let (tx_to_gui, rx_from_net): (Sender<String>, Receiver<String>) = unbounded();
-    let (tx_to_net, rx_from_gui): (Sender<String>, Receiver<String>) = unbounded();
-
+    let (tx_to_gui, rx_from_net) = unbounded::<(String, DamaPacket)>();
+    let (tx_to_net, rx_from_gui) = unbounded::<DamaPacket>();
     let id_str = local_peer_id.to_string();
 
     std::thread::spawn(move || {
@@ -123,24 +188,32 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             loop {
                 tokio::select! {
-                    cmd = async { rx_from_gui.recv() } => {
-                        if let Ok(line) = cmd {
-                            if line.starts_with("/connect") {
-                                if let Some(addr) = line.split_whitespace().last() {
+                    packet = async { rx_from_gui.recv() } => {
+                        if let Ok(p) = packet {
+                            if let DamaPacket::Text(t) = &p {
+                                if t.starts_with("/connect ") {
+                                    let addr = t.replace("/connect ", "");
                                     let _ = swarm.dial(addr.parse::<libp2p::Multiaddr>().unwrap());
+                                    continue;
                                 }
-                            } else {
-                                swarm.behaviour_mut().floodsub.publish(chat_topic.clone(), line.as_bytes());
                             }
+                            let bytes = serde_json::to_vec(&p).unwrap();
+                            swarm.behaviour_mut().floodsub.publish(chat_topic.clone(), bytes);
                         }
                     }
                     event = swarm.select_next_some() => match event {
                         SwarmEvent::NewListenAddr { address, .. } => {
-                            let _ = tx_to_gui.send(format!("📍 Адрес: {}", address));
+                            // Отправляем адрес в UI через специальный пакет
+                            let _ = tx_to_gui.send(("Система".into(), DamaPacket::SetAddress(address.to_string())));
+                        }
+                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            let _ = tx_to_gui.send(("Система".into(), DamaPacket::Text(format!("🤝 СОЕДИНЕНИЕ: {}", peer_id))));
+                            swarm.behaviour_mut().floodsub.add_node_to_partial_view(peer_id);
                         }
                         SwarmEvent::Behaviour(DamaBehaviourEvent::Floodsub(FloodsubEvent::Message(msg))) => {
-                            let text = String::from_utf8_lossy(&msg.data);
-                            let _ = tx_to_gui.send(format!("📩 Друг: {}", text));
+                            if let Ok(p) = serde_json::from_slice::<DamaPacket>(&msg.data) {
+                                let _ = tx_to_gui.send((msg.source.to_string(), p));
+                            }
                         }
                         _ => {}
                     }
@@ -149,10 +222,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         });
     });
 
-    let native_options = eframe::NativeOptions::default();
-    eframe::run_native(
-        "DAMA Core",
-        native_options,
-        Box::new(|cc| Box::new(DamaApp::new(cc, tx_to_net, rx_from_net, id_str))),
-    ).map_err(|e| e.to_string().into())
+    eframe::run_native("DAMA Core", eframe::NativeOptions::default(), Box::new(|cc| Box::new(DamaApp::new(cc, tx_to_net, rx_from_net, id_str))))
+        .map_err(|e| e.to_string().into())
 }
+
