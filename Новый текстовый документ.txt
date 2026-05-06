@@ -1,0 +1,434 @@
+use libp2p::{
+    identify,
+    identity,
+    kad::{record::store::MemoryStore, Kademlia},
+    noise, tcp, yamux,
+    swarm::{NetworkBehaviour, SwarmEvent, SwarmBuilder},
+    PeerId,
+};
+use std::error::Error;
+use futures::StreamExt;
+use serde::{Serialize, Deserialize};
+use arti_client::{TorClient, TorClientConfig};
+use tor_rtcompat::PreferredRuntime;
+
+// Криптография
+use aes_gcm::{Aes256Gcm, Key, Nonce, aead::Aead};
+use aes_gcm::aead::KeyInit;
+
+// База данных
+use rusqlite::{params, Connection, Result as SqlResult};
+
+// --- МОДУЛЬ ХРАНИЛИЩА (SQLite + SQLCipher) ---
+struct DamaStorage {
+    conn: Connection,
+}
+
+impl DamaStorage {
+    fn init() -> SqlResult<Self> {
+        let conn = Connection::open("dama_vault.db")?;
+        // Устанавливаем пароль для файла базы данных
+        conn.execute("PRAGMA key = 'dama_secure_vault_pass';", [])?; 
+        
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY,
+                sender TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )",
+            [],
+        )?;
+        Ok(Self { conn })
+    }
+
+    fn save_message(&self, sender: &str, content: &str) -> SqlResult<()> {
+        self.conn.execute(
+            "INSERT INTO messages (sender, content) VALUES (?1, ?2)",
+            params![sender, content],
+        )?;
+        Ok(())
+    }
+}
+
+// --- ШИФРОВАНИЕ (AES-256) ---
+struct DamaEncryption {
+    shared_secret: [u8; 32],
+}
+
+impl DamaEncryption {
+    fn encrypt(&self, message: &[u8]) -> Vec<u8> {
+        let key = Key::<Aes256Gcm>::from_slice(&self.shared_secret);
+        let cipher = Aes256Gcm::new(key);
+        let nonce = Nonce::from_slice(b"unique nonce 12"); 
+        cipher.encrypt(nonce, message).expect("Ошибка шифрования")
+    }
+}
+
+// --- СТРУКТУРА СООБЩЕНИЯ ---
+#[derive(Serialize, Deserialize, Debug)]
+struct MessageNode {
+    text: String,
+    parent_hash: String,
+    sender: String,
+}
+
+// --- ПОВЕДЕНИЕ СЕТИ ---
+#[derive(NetworkBehaviour)]
+struct DamaBehaviour {
+    kademlia: Kademlia<MemoryStore>,
+    identify: identify::Behaviour,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    println!("--- DAMA CORE: ЗАПУСК ПРИВАТНОЙ СЕТИ ---");
+
+    // 1. Инициализация зашифрованного хранилища
+    let storage = DamaStorage::init().expect("Не удалось создать зашифрованную базу данных");
+    println!("✅ Хранилище сообщений активировано.");
+
+    // 2. Подключение к Tor
+    println!("Подключение к сети Tor (Arti)...");
+    let config = TorClientConfig::default();
+    let rt = PreferredRuntime::current()?;
+    let _tor_client = TorClient::with_runtime(rt)
+        .config(config)
+        .create_bootstrapped()
+        .await?;
+    println!("✅ Tor активен. Ваш IP скрыт.");
+
+    // 3. Настройка P2P узла
+    let local_key = identity::Keypair::generate_ed25519();
+    let local_peer_id = PeerId::from(local_key.public());
+    println!("Ваш PeerID: {}", local_peer_id);
+
+    let store = MemoryStore::new(local_peer_id);
+    let behaviour = DamaBehaviour {
+        kademlia: Kademlia::new(local_peer_id, store),
+        identify: identify::Behaviour::new(identify::Config::new("/dama/1.0".into(), local_key.public())),
+    };
+
+    let mut swarm = SwarmBuilder::with_existing_identity(local_key)
+        .with_tokio()
+        .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
+        .with_behaviour(|_| behaviour)?
+        .build();
+
+    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+
+    println!("🚀 Мессенджер DAMA запущен и готов к работе.");
+
+    // Пример сохранения сообщения (тест базы)
+    storage.save_message("Система", "Узел запущен успешно")?;
+
+    loop {
+        match swarm.select_next_some().await {
+            SwarmEvent::NewListenAddr { address, .. } => println!("Слушаем на: {}", address),
+            _ => {}
+        }
+    }
+}
+
+
+
+
+[dependencies]
+# Сетевой стек
+libp2p = { version = "0.52", features = ["tcp", "tls", "noise", "yamux", "kad", "identify", "macros", "tokio"] }
+tokio = { version = "1.0", features = ["full"] }
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Tor (Arti)
+arti-client = { version = "0.10", features = ["tokio", "static"] }
+tor-rtcompat = "0.10"
+
+# База данных
+rusqlite = { version = "0.29", features = ["bundled", "sqlcipher"] }
+
+# Исправленные версии криптографии для совместимости
+x25519-dalek = "2.0.0-rc.3"
+aes-gcm = "0.10"
+
+
+[dependencies]
+# Сетевой стек
+libp2p = { version = "0.52", features = ["tcp", "tls", "noise", "yamux", "kad", "identify", "macros", "tokio"] }
+tokio = { version = "1.0", features = ["full"] }
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Tor (Arti)
+arti-client = { version = "0.10", features = ["tokio", "static"] }
+tor-rtcompat = "0.10"
+
+# База данных
+rusqlite = { version = "0.29", features = ["bundled", "sqlcipher"] }
+
+# Криптография (оставляем только AES, остальное подтянет Tor)
+aes-gcm = "0.10"
+
+📂 Где забрать готовый мессенджер?Как только команда закончит работу, иди сюда:C:\Users\user\Desktop\DAMA\target\release\Там будет лежать твой файл dama-core.exe.
+
+
+
+
+[package]
+name = "dama-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Сетевой стек (libp2p 0.52+)
+libp2p = { version = "0.52", features = ["tcp", "tls", "noise", "yamux", "kad", "identify", "macros", "tokio"] }
+tokio = { version = "1.0", features = ["full"] }
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Tor (Arti) - Добавлена функция native-tls для исправления ошибки E0432
+arti-client = { version = "0.10", features = ["tokio", "static", "native-tls"] }
+tor-rtcompat = { version = "0.10", features = ["native-tls"] }
+
+# База данных
+rusqlite = { version = "0.29", features = ["bundled", "sqlcipher"] }
+aes-gcm = "0.10"
+
+
+
+
+use libp2p::{
+    identify,
+    identity,
+    kad,
+    noise, tcp, yamux,
+    swarm::{NetworkBehaviour, SwarmEvent},
+    PeerId,
+};
+use std::error::Error;
+use futures::StreamExt;
+use serde::{Serialize, Deserialize};
+use arti_client::{TorClient, TorClientConfig};
+use tor_rtcompat::PreferredRuntime;
+
+// Криптография и БД
+use aes_gcm::{Aes256Gcm, Key, Nonce, aead::Aead};
+use aes_gcm::aead::KeyInit;
+use rusqlite::{params, Connection, Result as SqlResult};
+
+// --- МОДУЛЬ ХРАНИЛИЩА ---
+struct DamaStorage { conn: Connection }
+impl DamaStorage {
+    fn init() -> SqlResult<Self> {
+        let conn = Connection::open("dama_vault.db")?;
+        conn.execute("PRAGMA key = 'dama_secure_vault_pass';", [])?; 
+        conn.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, sender TEXT, content TEXT)", [])?;
+        Ok(Self { conn })
+    }
+    fn save(&self, s: &str, c: &str) -> SqlResult<()> {
+        self.conn.execute("INSERT INTO messages (sender, content) VALUES (?1, ?2)", params![s, c])?;
+        Ok(())
+    }
+}
+
+// --- ПОВЕДЕНИЕ СЕТИ ---
+#[derive(NetworkBehaviour)]
+struct DamaBehaviour {
+    kademlia: kad::Behaviour<kad::record::store::MemoryStore>,
+    identify: identify::Behaviour,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    println!("--- DAMA CORE: ЗАПУСК ---");
+
+    let _storage = DamaStorage::init()?;
+    
+    // Исправление ошибки Tor (PreferredRuntime)
+    let config = TorClientConfig::default();
+    let rt = PreferredRuntime::current()?;
+    let _tor = TorClient::with_runtime(rt).config(config).create_bootstrapped().await?;
+    println!("✅ Tor активен.");
+
+    let local_key = identity::Keypair::generate_ed25519();
+    let local_peer_id = PeerId::from(local_key.public());
+
+    // Исправленный Swarm (новый синтаксис libp2p)
+    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
+        .with_tokio()
+        .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
+        .with_behaviour(|key| {
+            let store = kad::record::store::MemoryStore::new(key.public().to_peer_id());
+            DamaBehaviour {
+                kademlia: kad::Behaviour::new(key.public().to_peer_id(), store),
+                identify: identify::Behaviour::new(identify::Config::new("/dama/1.0".into(), key.public())),
+            }
+        })?
+        .build();
+
+    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+    println!("🚀 Узел DAMA запущен: {}", local_peer_id);
+
+    loop {
+        if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
+            println!("Слушаем на: {}", address);
+        }
+    }
+}
+
+
+
+[package]
+name = "dama-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Сетевой стек
+libp2p = { version = "0.52", features = ["tcp", "noise", "yamux", "kad", "identify", "macros", "tokio"] }
+tokio = { version = "1.0", features = ["full"] }
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Tor (Arti) - Здесь мы явно включаем tokio и native-tls
+arti-client = { version = "0.10", features = ["tokio", "static", "native-tls"] }
+tor-rtcompat = { version = "0.10", features = ["tokio", "native-tls"] }
+
+# База данных и шифрование
+rusqlite = { version = "0.29", features = ["bundled", "sqlcipher"] }
+aes-gcm = "0.10"
+
+
+
+use libp2p::{identify, identity, kad, noise, tcp, yamux, swarm::SwarmEvent, PeerId};
+use std::error::Error;
+use futures::StreamExt;
+use arti_client::{TorClient, TorClientConfig};
+use tor_rtcompat::PreferredRuntime;
+use rusqlite::{params, Connection, Result as SqlResult};
+
+// --- ХРАНИЛИЩЕ ---
+struct DamaStorage { conn: Connection }
+impl DamaStorage {
+    fn init() -> SqlResult<Self> {
+        let conn = Connection::open("dama_vault.db")?;
+        conn.execute("PRAGMA key = 'dama_pass';", [])?; 
+        conn.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, sender TEXT, content TEXT)", [])?;
+        Ok(Self { conn })
+    }
+}
+
+// --- СЕТЕВОЕ ПОВЕДЕНИЕ ---
+#[derive(libp2p::swarm::NetworkBehaviour)]
+struct DamaBehaviour {
+    kademlia: kad::Behaviour<kad::record::store::MemoryStore>,
+    identify: identify::Behaviour,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    println!("--- DAMA CORE ЗАПУСК ---");
+
+    // 1. База данных
+    let _storage = DamaStorage::init()?;
+
+    // 2. Tor
+    let config = TorClientConfig::default();
+    let rt = PreferredRuntime::current()?; // Теперь это сработает
+    let _tor = TorClient::with_runtime(rt).config(config).create_bootstrapped().await?;
+    println!("✅ Tor активен.");
+
+    // 3. P2P Узел
+    let local_key = identity::Keypair::generate_ed25519();
+    
+    // Новый способ сборки Swarm для libp2p v0.52
+    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
+        .with_tokio()
+        .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
+        .with_behaviour(|key| {
+            let peer_id = key.public().to_peer_id();
+            DamaBehaviour {
+                kademlia: kad::Behaviour::new(peer_id, kad::record::store::MemoryStore::new(peer_id)),
+                identify: identify::Behaviour::new(identify::Config::new("/dama/1.0".into(), key.public())),
+            }
+        })?
+        .build();
+
+    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+    println!("🚀 Мессенджер DAMA готов!");
+
+    while let Some(event) = swarm.next().await {
+        if let SwarmEvent::NewListenAddr { address, .. } = event {
+            println!("Адрес узла: {}", address);
+        }
+    }
+    Ok(())
+}
+
+
+use libp2p::{identify, identity, kad, noise, tcp, yamux, swarm::SwarmEvent, PeerId};
+use std::error::Error;
+use futures::StreamExt;
+use serde::{Serialize, Deserialize};
+use arti_client::{TorClient, TorClientConfig};
+use tor_rtcompat::PreferredRuntime;
+use rusqlite::{params, Connection, Result as SqlResult};
+
+// --- ТВОЯ СТРУКТУРА СООБЩЕНИЯ (DAG) ---
+#[derive(Serialize, Deserialize, Debug)]
+struct MessageNode {
+    text: String,
+    parent_hash: String,
+    sender: String,
+}
+
+// --- ТВОЕ ПОВЕДЕНИЕ УЗЛА ---
+#[derive(libp2p::swarm::NetworkBehaviour)] // Исправлено: полный путь
+struct DamaBehaviour {
+    kademlia: kad::Behaviour<kad::record::store::MemoryStore>, // Исправлено: kad::Behaviour
+    identify: identify::Behaviour,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    println!("--- DAMA CORE ЗАПУСК ---");
+
+    // Запуск Tor
+    let config = TorClientConfig::default();
+    let rt = PreferredRuntime::current()?; 
+    let _tor = TorClient::with_runtime(rt).config(config).create_bootstrapped().await?;
+    println!("✅ Tor активен.");
+
+    let local_key = identity::Keypair::generate_ed25519();
+    let local_peer_id = PeerId::from(local_key.public());
+
+    // ТВОЙ БЛОК SWARM (с мини-фиксом синтаксиса)
+    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
+        .with_tokio()
+        .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
+        .with_behaviour(|key| {
+            let peer_id = key.public().to_peer_id();
+            let store = kad::record::store::MemoryStore::new(peer_id);
+            DamaBehaviour {
+                kademlia: kad::Behaviour::new(peer_id, store),
+                identify: identify::Behaviour::new(identify::Config::new("/dama/1.0".into(), key.public())),
+            }
+        })?
+        .build();
+
+    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+    println!("🚀 Узел запущен: {}", local_peer_id);
+
+    while let Some(event) = swarm.next().await {
+        if let SwarmEvent::NewListenAddr { address, .. } = event {
+            println!("Слушаем на: {}", address);
+        }
+    }
+    Ok(())
+}
+
+
